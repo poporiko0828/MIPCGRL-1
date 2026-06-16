@@ -30,6 +30,10 @@ from .logger import logger
 from .load_buffer import load_buffer
 from .load_instruction import load_instruction
 
+from transformers import AutoTokenizer, FlaxAutoModel
+import jax
+import jax.numpy as jnp
+
 n_job_for_reading = 16
 n_job_for_processing = 16
 n_job_for_massive_processing = 16
@@ -152,6 +156,9 @@ def create_normalize_dataset(
         dataset_dict = load_packaged_data(target_filepath)
 
     return dataset_dict
+
+
+
 
 
 def check_reward_distribution(rewards: np.ndarray) -> np.ndarray:

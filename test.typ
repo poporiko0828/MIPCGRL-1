@@ -1,2 +1,2 @@
 チェックしてね.
-roberta ver
+roberta vera
