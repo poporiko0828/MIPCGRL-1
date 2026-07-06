@@ -119,6 +119,10 @@ class Config:
 
     instruct_csv: Optional[str] = None
 
+    # 追加したパラメータ
+    resume: bool = False
+    resume_step: int = -1
+
 
 @dataclass
 class EncoderConfig(Config):

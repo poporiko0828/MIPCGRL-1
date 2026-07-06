@@ -4,6 +4,8 @@ import logging
 import os
 from glob import glob
 
+import sys
+import select
 import wandb
 import shutil
 from functools import partial
@@ -16,6 +18,7 @@ import jax.numpy as jnp
 import optax
 import orbax.checkpoint as ocp
 import pandas as pd
+from os.path import abspath, join, dirname
 from flax.training.train_state import TrainState
 from jax.experimental.array_serialization.serialization import logger
 from tensorboardX import SummaryWriter
@@ -53,6 +56,79 @@ from utils import make_sim_render_episode_single, render_callback
 
 logger = logging.getLogger(basename(__file__))
 logger.setLevel(getattr(logging, log_level, logging.INFO))
+
+
+# --- 既存の get_train_test と同等の処理を外出しにするヘルパー ---
+def load_new_instruction_from_csv(csv_name, config, max_instructs=128):
+    """新しいCSVから指示を読み込み、固定サイズ(max_instructs)にパディングして返すヘルパー"""
+    import os
+    import pandas as pd
+    import jax.numpy as jnp
+    import numpy as np
+    
+    # パスを解決 (環境に合わせて調整してください。以下は一例です)
+    # 確実に存在する絶対パスを指定
+    csv_path = f"/home/hosozawa/MIPCGRL_local/MIPCGRL/instruct/{csv_name}.csv"
+
+    if not os.path.exists(csv_path):
+        print(f" エラー: 指定されたファイルが見つかりません: {csv_path}")
+        return None
+            
+    try:
+        df = pd.read_csv(csv_path)
+        actual_rows = df.shape[0]
+        if actual_rows > max_instructs:
+            print(f"警告: CSVの行数({actual_rows})が最大サイズ({max_instructs})を超えています。切り捨てます。")
+            df = df.iloc[:max_instructs]
+            actual_rows = max_instructs
+
+        # 各種データの抽出
+        reward_i = df["reward_enum"].to_numpy()[:, None]
+        cond_cols = [c for c in df.columns if c.startswith("condition_")]
+        condition = df[cond_cols].to_numpy()
+        embed_cols = [c for c in df.columns if c.startswith("embed_")]
+        embedding = df[embed_cols].to_numpy()
+
+        # 固定サイズバッファの作成
+        padded_reward = np.zeros((max_instructs, reward_i.shape[1]), dtype=np.int32)
+        padded_cond = np.zeros((max_instructs, condition.shape[1]), dtype=np.int32) # 型をint32に統一
+        padded_embed = np.zeros((max_instructs, embedding.shape[1]), dtype=np.float32)
+        padded_mask = np.zeros((max_instructs,), dtype=bool)
+
+        # データの流し込み
+        padded_reward[:actual_rows] = reward_i
+        padded_cond[:actual_rows] = condition
+        padded_embed[:actual_rows] = embedding
+        padded_mask[:actual_rows] = True
+
+        return {
+            "reward_i": padded_reward,
+            "condition": padded_cond,
+            "embedding": padded_embed,
+            "mask": padded_mask
+        }
+    except Exception as e:
+        print(f" CSVの読み込み中にエラーが発生しました: {e}")
+        return None
+
+
+def check_pause_callback(update_i, current_reward_i, current_condition, current_embedding, current_mask, nlp_input_dim):
+    """JAXの内部からは、50回に1回ログを出すだけの軽量な処理に変更"""
+    if int(update_i) % 50 == 0:
+        print(f"\n[ Current Gym Instruct @ Update {update_i} ]")
+        print(f" -> reward_enum (パースされた報酬ID): {current_reward_i[0].tolist() if hasattr(current_reward_i, 'tolist') else current_reward_i[0]}")
+        print(f" -> condition (条件ベクトル): {current_condition[0].tolist() if hasattr(current_condition, 'tolist') else current_condition[0]}")
+        print("-" * 50)
+    
+    # 💡 常に現在の指示をそのままJAX側に返します（ここでは入力待ちをしない）
+    return (
+        current_reward_i, 
+        current_condition, 
+        current_embedding,
+        current_mask
+    )
+
+
 
 
 def log_callback(metric, steps_prev_complete, config, writer, train_start_time):
@@ -217,10 +293,24 @@ def make_train(config, restored_ckpt, checkpoint_manager, encoder_params):
                 join(dirname(__file__), "instruct", f"{config.instruct_csv}.csv")
             )
 
-            instruct_df = pd.read_csv(csv_path)
+            instruct_df = pd.read_csv(csv_path, sep=None, engine='python')
 
             def get_train_test(df, is_train=True):
-                df = df[df["train"] == is_train]
+                # ★ 修正: train列の表記揺れ（文字列の "True", "TRUE", "1" など）を安全にブール値に変換
+                if "train" in df.columns:
+                    # 文字列や大文字小文字を統一して比較
+                    train_mask = df["train"].astype(str).str.upper().str.strip()
+                    if is_train:
+                        df = df[train_mask.isin(["TRUE", "1", "1.0"])]
+                    else:
+                        df = df[train_mask.isin(["FALSE", "0", "0.0"])]
+                else:
+                    raise KeyError(f"CSVファイルに 'train' 列が見つかりません。列名を確認してください。カラム一覧: {list(df.columns)}")
+
+                # データが0行になっていないかチェック
+                if len(df) == 0:
+                    mode_str = "train == True" if is_train else "train == False"
+                    raise ValueError(f"指示CSV【{config.instruct_csv}】から {mode_str} となるデータが1行も検出されませんでした。ファイルの中身やフォーマットを確認してください。")
 
                 embedding_df = df.filter(regex="embed_*")
                 embedding_df = embedding_df.reindex(
@@ -243,9 +333,10 @@ def make_train(config, restored_ckpt, checkpoint_manager, encoder_params):
                 )
                 condition = jnp.array(condition_df.to_numpy())
 
-                reward_enum_list = [[int(digit) for digit in str(num)] for num in instruct_df["reward_enum"].to_list()]
+                # ★ 修正: インデックスエラーを避けるため、絞り込んだ後の df から抽出
+                reward_enum_list = [[int(digit) for digit in str(num)] for num in df["reward_enum"].to_list()]
 
-                max_len = max(len(x) for x in reward_enum_list)
+                max_len = max(len(x) for x in reward_enum_list) if reward_enum_list else 1
 
                 reward_enum = jnp.array([
                     x + [0] * (max_len - len(x)) for x in reward_enum_list
@@ -278,6 +369,8 @@ def make_train(config, restored_ckpt, checkpoint_manager, encoder_params):
             params=network_params,
             tx=tx,
         )
+
+       
 
         # INIT ENV FOR TRAIN
         rng, _rng = jax.random.split(rng)
@@ -602,6 +695,83 @@ def make_train(config, restored_ckpt, checkpoint_manager, encoder_params):
                     lambda _: instruct_sample,  # No update if condition is false; keep train_inst as is
                     operand=None,
                 )
+
+
+            
+
+            # ========================================================
+            # ★ アイデア1対応: マスクを用いた固定サイズ動的サンプリング
+            # ========================================================
+            # 初回のみプール変数を初期化
+            if 'current_pool_reward_i' not in locals():
+                max_instructs = 128
+                actual_rows = train_inst.reward_i.shape[0]
+                
+                # 元のデータの型(train_inst.***.dtype)をそのまま引き継ぐ
+                padded_reward = jnp.zeros((max_instructs, train_inst.reward_i.shape[1]), dtype=train_inst.reward_i.dtype)
+                padded_cond = jnp.zeros((max_instructs, train_inst.condition.shape[1]), dtype=train_inst.condition.dtype)
+                padded_embed = jnp.zeros((max_instructs, train_inst.embedding.shape[1]), dtype=train_inst.embedding.dtype)
+                
+                # 初期プールを流し込む
+                current_pool_reward_i = padded_reward.at[:actual_rows].set(train_inst.reward_i)
+                current_pool_condition = padded_cond.at[:actual_rows].set(train_inst.condition)
+                current_pool_embedding = padded_embed.at[:actual_rows].set(train_inst.embedding)
+                
+                # 初期マスクの生成 (有効行だけTrue)
+                padded_mask = jnp.zeros((max_instructs,), dtype=jnp.bool_)
+                current_pool_mask = padded_mask.at[:actual_rows].set(True)
+
+            # JAX側への結果形状の通知（128行固定）
+            result_shapes = (
+                jax.ShapeDtypeStruct(current_pool_reward_i.shape, current_pool_reward_i.dtype),
+                jax.ShapeDtypeStruct(current_pool_condition.shape, current_pool_condition.dtype),
+                jax.ShapeDtypeStruct(current_pool_embedding.shape, current_pool_embedding.dtype),
+                jax.ShapeDtypeStruct(current_pool_mask.shape, current_pool_mask.dtype),
+            )
+
+            # 💡 引数の最後に config.nlp_input_dim を追加
+            new_pool_reward_i, new_pool_condition, new_pool_embedding, new_pool_mask = jax.pure_callback(
+                check_pause_callback,
+                result_shapes,
+                update_steps,
+                current_pool_reward_i,
+                current_pool_condition,
+                current_pool_embedding,
+                current_pool_mask,
+                config.nlp_input_dim,
+            )
+            
+            current_pool_reward_i = new_pool_reward_i
+            current_pool_condition = new_pool_condition
+            current_pool_embedding = new_pool_embedding
+            current_pool_mask = new_pool_mask
+
+            # 有効なインデックスから安全にサンプリングする関数
+            def _update_instruct():
+                nonlocal rng
+                raw_indices = jax.random.randint(
+                    rng, (config.n_envs,), 0, current_pool_reward_i.shape[0]
+                )
+                
+                valid_indices = jnp.where(current_pool_mask, size=current_pool_mask.shape[0], fill_value=0)[0]
+                num_valid = jnp.maximum(1, jnp.sum(current_pool_mask))
+                
+                safe_indices = valid_indices[jnp.mod(raw_indices, num_valid)]
+                
+                return instruct_sample.replace(
+                    reward_i=current_pool_reward_i[safe_indices],
+                    condition=current_pool_condition[safe_indices],
+                    embedding=current_pool_embedding[safe_indices]
+                )
+
+            if train_inst is not None:
+                instruct_sample = jax.lax.cond(
+                    update_steps % config.instruct_freq == 0,
+                    lambda _: _update_instruct(),
+                    lambda _: instruct_sample,
+                    operand=None,
+                )
+            # ========================================================
 
             def _evaluate_step():
 
@@ -971,32 +1141,88 @@ def init_checkpointer(config: Config) -> Tuple[Any, dict]:
     return checkpoint_manager, restored_ckpt, enc_param
 
 
-def main_chunk(config, rng, exp_dir):
-    """When jax jits the training loop, it pre-allocates an array with size equal to number of training steps. So, when training for a very long time, we sometimes need to break training up into multiple
-    chunks to save on VRAM.
-    """
+def main_chunk(config, exp_dir, rng):
+    env, env_params = gymnax_pcgrl_make(config.env_name, config=config)
+    network = init_network(env, env_params, config)
+    checkpoint_manager, restored_ckpt, encoder_params = init_checkpointer(config)
 
-    checkpoint_manager, restored_ckpt, encoder_param = init_checkpointer(config)
+    # 💡 1チャンクあたりのステップ数をシステム本来の「30,720歩」に固定
+    INTERVAL_STEPS = 30720
+    original_total_timesteps = config.total_timesteps
+    
 
-    if restored_ckpt is None:
-        progress_csv_path = os.path.join(exp_dir, "progress.csv")
-        assert not os.path.exists(progress_csv_path), (
-            "Progress csv already exists, but have no checkpoint to restore "
-            + "from. Run with `overwrite=True` to delete the progress csv."
-        )
-        # Create csv for logging progress
-        with open(os.path.join(exp_dir, "progress.csv"), "w") as f:
-            f.write("timestep,ep_return\n")
+    # JAX側に「1回あたり30,720歩」を総ステップ数として誤認させ、評価タイミングと同期させる
+    config.total_timesteps = INTERVAL_STEPS  
 
-    train_jit = jax.jit(
-        make_train(config, restored_ckpt, checkpoint_manager, encoder_param)
-    )
-    out = train_jit(rng)
+    train_init = make_train(config, restored_ckpt, checkpoint_manager, encoder_params)
+    train_jit = jax.jit(train_init)
 
-    jax.block_until_ready(out)
+    n_chunks = original_total_timesteps // INTERVAL_STEPS
+    if n_chunks == 0:
+        n_chunks = 1
 
+    logger.info(f"学習を開始します (全 {n_chunks} チャンク / 1チャンク={INTERVAL_STEPS} steps)")
+    print("\n🚀 【高速・メモリ節約モード】ノンストップで自動連投を実行します。")
+    print("💡 指示を変更したい場合は、学習中にターミナルで 'p' を入力してEnterを押しておいてください。")
+    print("   次の節目のタイミング（30,720歩ごと）で自動的に検知して一時停止します。\n")
+
+    import sys
+    import select
+
+    cumulative_step = 0  # 💡 対策②: ループ回数による進捗の迷子を防ぐ累積カウンター
+    out = None
+    
+    for chunk_i in range(n_chunks):
+        logger.info(f"=== チャンク {chunk_i + 1} / {n_chunks} を実行中 (累積開始ステップ: {cumulative_step}) ===")
+        
+        # 30,720歩分をGPUで爆速実行 (動画保存をスキップするためクラッシュしません)
+        out = train_jit(rng)
+        
+        # GPUの計算が完全に終了するまで待機
+        jax.block_until_ready(out)
+        
+        # 今回の周回分（30,720歩）を累積に加算
+        cumulative_step += INTERVAL_STEPS
+        
+        # 乱数状態（rng）を次の周回へ安全に引き継ぐ
+        try:
+            if isinstance(out, tuple) and len(out) > 0:
+                runner_state = out[0]
+                if hasattr(runner_state, "rng"):
+                    rng = runner_state.rng
+                elif isinstance(runner_state, dict) and "rng" in runner_state:
+                    rng = runner_state["rng"]
+        except Exception as e:
+            logger.warning(f"rng の引き継ぎに失敗しました（現在の rng をキープします）: {e}")
+
+        # 💡 非同期キーボードチェック (0.001秒だけ標準入力を覗き見する)
+        rlist, _, _ = select.select([sys.stdin], [], [], 0.001)
+        
+        if rlist:
+            user_input = sys.stdin.readline().strip()
+            # ユーザーが事前に 'p' + Enter を入力していた場合のみ介入
+            if user_input == 'p':
+                print(f"\n[⏸️ ユーザー要求により 累積 {cumulative_step} steps 時点で一時停止しました]")
+                print("="*50)
+                print("新しい指示CSVファイル名を入力してください（例: manybats）")
+                print("="*50)
+                new_csv = input("New instruct_csv >> ").strip()
+                if new_csv:
+                    new_data = load_new_instruction_from_csv(new_csv, config, max_instructs=128)
+                    if new_data is not None:
+                        config.instruct_csv = new_csv
+                        print(f"✅ 成功: 指示を【{new_csv}】に更新しました。")
+                        
+                        print("JAX関数を新しい指示で再コンパイルしています... (少し時間がかかります)")
+                        train_init = make_train(config, restored_ckpt, checkpoint_manager, encoder_params)
+                        train_jit = jax.jit(train_init)
+                    else:
+                        print("❌ 読み込み失敗。指示は変更されませんでした。")
+                print("▶️ 学習を再開します。変更したい場合は再度 'p' + Enter を入力してください。\n")
+
+    # 最後に一応元の設定に戻しておく
+    config.total_timesteps = original_total_timesteps
     return out
-
 
 @hydra.main(version_base=None, config_path="./conf", config_name="train_pcgrl")
 def main(config: TrainConfig):
@@ -1031,21 +1257,12 @@ def main(config: TrainConfig):
         )
         wandb.config.update(dict(config), allow_val_change=True)
 
-    # Need to do this before setting up checkpoint manager so that it doesn't refer to old checkpoints.
+    # 古いチェックポイントの削除
     if config.overwrite and os.path.exists(exp_dir):
         shutil.rmtree(exp_dir)
 
-    if config.timestep_chunk_size != -1:
-        n_chunks = config.total_timesteps // config.timestep_chunk_size
-        for i in range(n_chunks):
-            config.total_timesteps = config.timestep_chunk_size + (
-                i * config.timestep_chunk_size
-            )
-            print(f"Running chunk {i + 1}/{n_chunks}")
-            out = main_chunk(config, rng, exp_dir)
-
-    else:
-        out = main_chunk(config, rng, exp_dir)
+    # 呼び出し側も正しい引数の順番 (config, exp_dir, rng) に統一
+    out = main_chunk(config, exp_dir, rng)
 
 
 if __name__ == "__main__":
