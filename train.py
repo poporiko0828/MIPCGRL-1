@@ -3,6 +3,7 @@ from datetime import datetime
 import logging
 import os
 from glob import glob
+from omegaconf import OmegaConf  # 💡 これをここに追加！
 
 import sys
 import select
@@ -191,6 +192,11 @@ def eval_callback(
 
     if len(timesteps) > 0:
         t = timesteps[-1].item()
+
+        # 💡 【追加項目】もし外側のループから累積ステップが渡されていれば、それを足す
+        if hasattr(config, "cumulative_step_offset"):
+            t = config.cumulative_step_offset + t
+
         ep_return_mean = return_values.mean()
         ep_return_max = return_values.max()
         ep_return_min = return_values.min()
@@ -1175,14 +1181,43 @@ def main_chunk(config, exp_dir, rng):
     for chunk_i in range(n_chunks):
         logger.info(f"=== チャンク {chunk_i + 1} / {n_chunks} を実行中 (累積開始ステップ: {cumulative_step}) ===")
         
-        # 30,720歩分をGPUで爆速実行 (動画保存をスキップするためクラッシュしません)
+        train_start_time = timer()
+        # 1. 30,720歩分をGPUで爆速実行（この内部で自動的に _30720.png 等が保存されます）
         out = train_jit(rng)
+        out = jax.block_until_ready(out) # 完了を待つ
         
-        # GPUの計算が完全に終了するまで待機
-        jax.block_until_ready(out)
-        
-        # 今回の周回分（30,720歩）を累積に加算
+        # 📸 2. 【今回追加するリネーム処理】
+        # JAXが保存した固定名（30720）のファイルを、累積ステップ数の名前に変更して避難させる
+        try:
+            import shutil
+            
+            # 今回の本当の合計ステップ数（例: 30720, 61440, 92160...）
+            actual_step = cumulative_step + INTERVAL_STEPS
+            
+            # 元々の保存先パスを再現
+            base_img_path = os.path.join(config._img_dir, "image_30720.png")
+            base_vid_path = os.path.join(config._vid_dir, "video_30720.gif")
+            
+            # 新しい連番の保存先パス
+            new_img_path = os.path.join(config._img_dir, f"image_{actual_step}.png")
+            new_vid_path = os.path.join(config._vid_dir, f"video_{actual_step}.gif")
+            
+            # ファイルが存在すれば、上書きされる前に別名でコピー（または移動）
+            if os.path.exists(base_img_path):
+                shutil.copyfile(base_img_path, new_img_path)
+                logger.info(f"🔄 連番画像を生成しました: image_{actual_step}.png")
+                
+            if os.path.exists(base_vid_path):
+                shutil.copyfile(base_vid_path, new_vid_path)
+                logger.info(f"🔄 連番GIFを生成しました: video_{actual_step}.gif")
+                
+        except Exception as rename_err:
+            logger.warning(f"⚠️ 連番ファイルへの変更中にスキップ可能なエラーが発生しました: {rename_err}")
+
+        # 3. 今回の周回分（30,720歩）を累積に加算して次の周へ
         cumulative_step += INTERVAL_STEPS
+        
+        # --- この後に既存のキーボードチェック（select.select） ---
         
         # 乱数状態（rng）を次の周回へ安全に引き継ぐ
         try:
@@ -1212,6 +1247,35 @@ def main_chunk(config, exp_dir, rng):
                     if new_data is not None:
                         config.instruct_csv = new_csv
                         print(f"✅ 成功: 指示を【{new_csv}】に更新しました。")
+
+                        # ==========================================================
+                        # 🌟 【ここを追加】指示変更ログの自動保存処理
+                        # ==========================================================
+                        try:
+                            log_path = os.path.join(exp_dir, "instruction_log.csv")
+                            
+                            # 記録するデータの準備
+                            # ※ total_stepsが計算できるタイミングの現在のステップ数（直近のstep）
+                            current_step = cumulative_step
+                            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            
+                            # 新規作成か追記かを判定してデータフレームを作成
+                            log_df = pd.DataFrame([{
+                                "timestamp": timestamp,
+                                "total_steps": current_step,
+                                "instruct_csv": config.instruct_csv
+                            }])
+                            
+                            # ファイルが存在しない場合はヘッダー付き、存在する場合はヘッダーなしで追記
+                            if not os.path.exists(log_path):
+                                log_df.to_csv(log_path, index=False)
+                            else:
+                                log_df.to_csv(log_path, mode='a', header=False, index=False)
+                                
+                            print(f"💾 指示変更ログを保存しました: {log_path}")
+                        except Exception as log_err:
+                            print(f"⚠️ ログ保存中にエラーが発生しました: {log_err}")
+                        # ==========================================================
                         
                         print("JAX関数を新しい指示で再コンパイルしています... (少し時間がかかります)")
                         train_init = make_train(config, restored_ckpt, checkpoint_manager, encoder_params)
