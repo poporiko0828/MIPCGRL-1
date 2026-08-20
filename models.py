@@ -13,10 +13,8 @@ from transformers import FlaxBertModel
 from envs.pcgrl_env import PCGRLObs
 from conf.config import EncoderConfig
 
-try:
-    import distrax
-except:
-    pass
+import distrax
+
 
 
 def crop_rf(x, rf_size):

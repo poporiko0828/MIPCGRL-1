@@ -5,6 +5,7 @@ import os
 from glob import glob
 from omegaconf import OmegaConf  # 💡 これをここに追加！
 
+import threading
 import sys
 import select
 import wandb
@@ -669,11 +670,12 @@ def make_train(config, restored_ckpt, checkpoint_manager, encoder_params):
 
             rng = update_state[-1]
 
-            # Save weight to checkpoint
+            
             jax.debug.callback(
                 save_checkpoint, runner_state, metric, steps_prev_complete
             )
             jax.debug.callback(_log_callback, metric)
+            
 
             runner_state = RunnerState(
                 train_state,
@@ -706,7 +708,7 @@ def make_train(config, restored_ckpt, checkpoint_manager, encoder_params):
             
 
             # ========================================================
-            # ★ アイデア1対応: マスクを用いた固定サイズ動的サンプリング
+            # ★ アイデア1対応: マスクを用いた固定サイズ動的サンプリング（アプローチA適用）
             # ========================================================
             # 初回のみプール変数を初期化
             if 'current_pool_reward_i' not in locals():
@@ -735,22 +737,42 @@ def make_train(config, restored_ckpt, checkpoint_manager, encoder_params):
                 jax.ShapeDtypeStruct(current_pool_mask.shape, current_pool_mask.dtype),
             )
 
-            # 💡 引数の最後に config.nlp_input_dim を追加
-            new_pool_reward_i, new_pool_condition, new_pool_embedding, new_pool_mask = jax.pure_callback(
-                check_pause_callback,
-                result_shapes,
-                update_steps,
-                current_pool_reward_i,
-                current_pool_condition,
-                current_pool_embedding,
-                current_pool_mask,
-                config.nlp_input_dim,
+            # --------------------------------------------------------
+            # 💡 【アプローチA】指定したステップ頻度の時だけ CPU 問い合わせを実行
+            # --------------------------------------------------------
+            def _fetch_latest_pool(_):
+                return jax.pure_callback(
+                    check_pause_callback,
+                    result_shapes,
+                    update_steps,
+                    current_pool_reward_i,
+                    current_pool_condition,
+                    current_pool_embedding,
+                    current_pool_mask,
+                    config.nlp_input_dim,
+                )
+
+            def _keep_current_pool(_):
+                return (
+                    current_pool_reward_i,
+                    current_pool_condition,
+                    current_pool_embedding,
+                    current_pool_mask,
+                )
+
+            # update_steps % config.instruct_freq == 0 の時だけ pure_callback を発火
+            new_pool_reward_i, new_pool_condition, new_pool_embedding, new_pool_mask = jax.lax.cond(
+                update_steps % config.instruct_freq == 0,
+                _fetch_latest_pool,
+                _keep_current_pool,
+                operand=None,
             )
             
             current_pool_reward_i = new_pool_reward_i
             current_pool_condition = new_pool_condition
             current_pool_embedding = new_pool_embedding
             current_pool_mask = new_pool_mask
+            # --------------------------------------------------------
 
             # 有効なインデックスから安全にサンプリングする関数
             def _update_instruct():
@@ -777,7 +799,8 @@ def make_train(config, restored_ckpt, checkpoint_manager, encoder_params):
                     lambda _: instruct_sample,
                     operand=None,
                 )
-            # ========================================================
+
+            #==================================================================================
 
             def _evaluate_step():
 
@@ -1182,9 +1205,45 @@ def main_chunk(config, exp_dir, rng):
         logger.info(f"=== チャンク {chunk_i + 1} / {n_chunks} を実行中 (累積開始ステップ: {cumulative_step}) ===")
         
         train_start_time = timer()
-        # 1. 30,720歩分をGPUで爆速実行（この内部で自動的に _30720.png 等が保存されます）
+        # ========================================================
+        # 📊 【ステップ1】jax.profiler の仕込み
+        # 1チャンク目はウォームアップ（JITコンパイル）として流し、
+        # 2チャンク目（chunk_i == 1）の時だけ データを取得する
+        # ========================================================
+        should_profile = (chunk_i == 1)  # 2チャンク目でプロファイル実行
+
+        if should_profile:
+            trace_dir = os.path.join(exp_dir, "tensorboard_trace")
+            print(f"\n[📊 PROFILER] プロファイリングを開始します（5秒後に自動停止します）... (保存先: {trace_dir})")
+            
+            # トレース開始
+            jax.profiler.start_trace(trace_dir)
+            
+            # ⏱️ 別スレッドで5秒後に stop_trace() を呼ぶタイマーを仕込む
+            def stop_profiler():
+                try:
+                    jax.profiler.stop_trace()
+                    print("\n[📊 PROFILER] 5秒経過したため、プロファイリングを自動停止・保存しました！\n")
+                except Exception as e:
+                    pass  # すでに停止している場合などの安全策
+
+            timer_thread = threading.Timer(5.0, stop_profiler)
+            timer_thread.start()
+
+        # 1. GPU処理を実行
         out = train_jit(rng)
         out = jax.block_until_ready(out) # 完了を待つ
+
+        # 万が一5秒未満で終わった場合のクリーンアップ
+        if should_profile:
+            timer_thread.cancel()  # タイマー解除
+            try:
+                jax.profiler.stop_trace()
+            except Exception:
+                pass
+        # ========================================================
+        
+      
         
         # 📸 2. 【今回追加するリネーム処理】
         # JAXが保存した固定名（30720）のファイルを、累積ステップ数の名前に変更して避難させる
