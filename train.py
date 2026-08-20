@@ -60,6 +60,15 @@ from utils import make_sim_render_episode_single, render_callback
 logger = logging.getLogger(basename(__file__))
 logger.setLevel(getattr(logging, log_level, logging.INFO))
 
+# ========================================================
+# 💡 RLHF: 学習開始時の人間報酬重み（rm_weights.npy）の自動リセット処理
+
+WEIGHT_FILE = "rm_weights.npy"
+
+# スクリプトが読み込まれた（＝学習が開始された）タイミングでファイルを初期値 (1.0) に上書き
+np.save(WEIGHT_FILE, 1.0)
+print(f"🔄 [RLHF] 学習スタートに伴い、'{WEIGHT_FILE}' を初期値 (1.0) にリセットしました。")
+# ========================================================
 
 # --- 既存の get_train_test と同等の処理を外出しにするヘルパー ---
 def load_new_instruction_from_csv(csv_name, config, max_instructs=128):
@@ -115,20 +124,11 @@ def load_new_instruction_from_csv(csv_name, config, max_instructs=128):
 
 
 
+from reward_model import get_human_reward
+
 def get_human_reward_callback(env_map):
-    """
-    JAXからマップ状態 (H, W) または (B, H, W) を受け取り、
-    外部の報酬モデル(RM)の評価スコアを返すCallback関数。
-    ※ 初期状態は、ダミーとして「特定タイル（壁など）の密度」や「固定値」を返すか、
-       保存された .npy / .pth からスコアを計算して返します。
-    """
-    # env_map は numpy.ndarray として渡される
-    # ここでは仮に「マップ全体の特定の計算スコア」や「ダミー値 0.0」を返す設計にします
-    # 後でここに PyTorch / 軽量モデルの推論処理を組み込みます
-    
-    # 例: ダミーとして全環境分 0.0 のスコアを返す (shape: [n_envs])
-    batch_size = env_map.shape[0] if len(env_map.shape) > 2 else 1
-    return np.zeros((batch_size,), dtype=np.float32)
+    """JAXのpure_callbackから呼ばれ、報酬モデルの推論結果を返す"""
+    return get_human_reward(env_map)
 
 
 
@@ -556,13 +556,21 @@ def make_train(config, restored_ckpt, checkpoint_manager, encoder_params):
                     env_state.env_state.env_map, # 現在の最新マップ状態 (n_envs, H, W)
                 )
 
-                # 重みパラメータ (lambda_human) をかけて指示報酬に足し合わせる
-                lambda_human = 0.2
-                total_reward_batch = reward_batch + lambda_human * r_human
                 # ========================================================
+                # 💡 調整案2: 重み係数 (lambda_human) を 0.2 から 0.05 に引き下げ
+                # 元の指示報酬の10%〜20%程度の大きさに抑えて Reward Hacking を防ぐ
+                # ========================================================
+                lambda_human = 0.05 
+                
+                # 💡 調整案: done == True (マップ生成完了時) のステップだけ r_human を付与
+                # step実行中の途中経過では r_human を 0 にしてノイズや過剰学習を防ぐ
+                r_human_masked = jnp.where(done, r_human, 0.0)
 
-                # 💡 指示報酬 + 人間報酬の合計値 (total_reward_batch) を最終報酬として採用
+                # 元のステップ報酬（reward_batch）に、doneの瞬間だけ人間報酬を上乗せする
+                total_reward_batch = reward_batch + lambda_human * r_human_masked
+
                 reward = jnp.where(done, reward_env, total_reward_batch)
+
 
                 env_state = env_state.replace(
                     returned_episode_returns=(
@@ -1242,45 +1250,44 @@ def main_chunk(config, exp_dir, rng):
         logger.info(f"=== チャンク {chunk_i + 1} / {n_chunks} を実行中 (累積開始ステップ: {cumulative_step}) ===")
         
         train_start_time = timer()
-        # ========================================================
-        # 📊 【ステップ1】jax.profiler の仕込み
-        # 1チャンク目はウォームアップ（JITコンパイル）として流し、
-        # 2チャンク目（chunk_i == 1）の時だけ データを取得する
-        # ========================================================
-        should_profile = (chunk_i == 1)  # 2チャンク目でプロファイル実行
 
-        if should_profile:
-            trace_dir = os.path.join(exp_dir, "tensorboard_trace")
-            print(f"\n[📊 PROFILER] プロファイリングを開始します（5秒後に自動停止します）... (保存先: {trace_dir})")
-            
-            # トレース開始
-            jax.profiler.start_trace(trace_dir)
-            
-            # ⏱️ 別スレッドで5秒後に stop_trace() を呼ぶタイマーを仕込む
-            def stop_profiler():
-                try:
-                    jax.profiler.stop_trace()
-                    print("\n[📊 PROFILER] 5秒経過したため、プロファイリングを自動停止・保存しました！\n")
-                except Exception as e:
-                    pass  # すでに停止している場合などの安全策
-
-            timer_thread = threading.Timer(5.0, stop_profiler)
-            timer_thread.start()
+        # ========================================================
+        # 📊 【コメントアウト】jax.profiler 周りの処理
+        # ========================================================
+        # should_profile = (chunk_i == 1)  # 2チャンク目でプロファイル実行
+        # if should_profile:
+        #     trace_dir = os.path.join(exp_dir, "tensorboard_trace")
+        #     print(f"\n[📊 PROFILER] プロファイリングを開始します（5秒後に自動停止します）... (保存先: {trace_dir})")
+        #     
+        #     # トレース開始
+        #     jax.profiler.start_trace(trace_dir)
+        #     
+        #     # ⏱️ 別スレッドで5秒後に stop_trace() を呼ぶタイマーを仕込む
+        #     def stop_profiler():
+        #         try:
+        #             jax.profiler.stop_trace()
+        #             print("\n[📊 PROFILER] 5秒経過したため、プロファイリングを自動停止・保存しました！\n")
+        #         except Exception as e:
+        #             pass  # すでに停止している場合などの安全策
+        #
+        #     timer_thread = threading.Timer(5.0, stop_profiler)
+        #     timer_thread.start()
+        # ========================================================
 
         # 1. GPU処理を実行
         out = train_jit(rng)
         out = jax.block_until_ready(out) # 完了を待つ
 
-        # 万が一5秒未満で終わった場合のクリーンアップ
-        if should_profile:
-            timer_thread.cancel()  # タイマー解除
-            try:
-                jax.profiler.stop_trace()
-            except Exception:
-                pass
         # ========================================================
-        
-      
+        # 📊 【コメントアウト】プロファイラークリーンアップ処理
+        # ========================================================
+        # if should_profile:
+        #     timer_thread.cancel()  # タイマー解除
+        #     try:
+        #         jax.profiler.stop_trace()
+        #     except Exception:
+        #         pass
+        # ========================================================
         
         # 📸 2. 【今回追加するリネーム処理】
         # JAXが保存した固定名（30720）のファイルを、累積ステップ数の名前に変更して避難させる
@@ -1345,13 +1352,12 @@ def main_chunk(config, exp_dir, rng):
                         print(f"✅ 成功: 指示を【{new_csv}】に更新しました。")
 
                         # ==========================================================
-                        # 🌟 【ここを追加】指示変更ログの自動保存処理
+                        # 🌟 指示変更ログの自動保存処理
                         # ==========================================================
                         try:
                             log_path = os.path.join(exp_dir, "instruction_log.csv")
                             
                             # 記録するデータの準備
-                            # ※ total_stepsが計算できるタイミングの現在のステップ数（直近のstep）
                             current_step = cumulative_step
                             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                             
