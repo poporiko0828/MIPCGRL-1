@@ -17,6 +17,7 @@ from typing import Any, NamedTuple, Tuple
 import hydra
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import pandas as pd
@@ -66,7 +67,6 @@ def load_new_instruction_from_csv(csv_name, config, max_instructs=128):
     import os
     import pandas as pd
     import jax.numpy as jnp
-    import numpy as np
     
     # パスを解決 (環境に合わせて調整してください。以下は一例です)
     # 確実に存在する絶対パスを指定
@@ -112,6 +112,24 @@ def load_new_instruction_from_csv(csv_name, config, max_instructs=128):
     except Exception as e:
         print(f" CSVの読み込み中にエラーが発生しました: {e}")
         return None
+
+
+
+def get_human_reward_callback(env_map):
+    """
+    JAXからマップ状態 (H, W) または (B, H, W) を受け取り、
+    外部の報酬モデル(RM)の評価スコアを返すCallback関数。
+    ※ 初期状態は、ダミーとして「特定タイル（壁など）の密度」や「固定値」を返すか、
+       保存された .npy / .pth からスコアを計算して返します。
+    """
+    # env_map は numpy.ndarray として渡される
+    # ここでは仮に「マップ全体の特定の計算スコア」や「ダミー値 0.0」を返す設計にします
+    # 後でここに PyTorch / 軽量モデルの推論処理を組み込みます
+    
+    # 例: ダミーとして全環境分 0.0 のスコアを返す (shape: [n_envs])
+    batch_size = env_map.shape[0] if len(env_map.shape) > 2 else 1
+    return np.zeros((batch_size,), dtype=np.float32)
+
 
 
 def check_pause_callback(update_i, current_reward_i, current_condition, current_embedding, current_mask, nlp_input_dim):
@@ -525,7 +543,26 @@ def make_train(config, restored_ckpt, checkpoint_manager, encoder_params):
                 else:
                     reward_batch = reward_env
 
-                reward = jnp.where(done, reward_env, reward_batch)
+                # ========================================================
+                # 💡 RLHF: 人間好みスコア（R_human）の取得と合算 (Step 1)
+                # ========================================================
+                # JAX側へ返す配列形状の指定 (環境数分のスカラー値)
+                rm_result_shape = jax.ShapeDtypeStruct((config.n_envs,), jnp.float32)
+
+                # pure_callback で CPU 側の get_human_reward_callback を呼び出す
+                r_human = jax.pure_callback(
+                    get_human_reward_callback,
+                    rm_result_shape,
+                    env_state.env_state.env_map, # 現在の最新マップ状態 (n_envs, H, W)
+                )
+
+                # 重みパラメータ (lambda_human) をかけて指示報酬に足し合わせる
+                lambda_human = 0.2
+                total_reward_batch = reward_batch + lambda_human * r_human
+                # ========================================================
+
+                # 💡 指示報酬 + 人間報酬の合計値 (total_reward_batch) を最終報酬として採用
+                reward = jnp.where(done, reward_env, total_reward_batch)
 
                 env_state = env_state.replace(
                     returned_episode_returns=(
