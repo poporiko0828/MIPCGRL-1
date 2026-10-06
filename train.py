@@ -60,6 +60,8 @@ from utils import make_sim_render_episode_single, render_callback
 logger = logging.getLogger(basename(__file__))
 logger.setLevel(getattr(logging, log_level, logging.INFO))
 
+
+
 # ========================================================
 # 💡 RLHF: 学習開始時の人間報酬重み（rm_weights.npy）の自動リセット処理
 
@@ -69,6 +71,33 @@ WEIGHT_FILE = "rm_weights.npy"
 np.save(WEIGHT_FILE, 1.0)
 print(f"🔄 [RLHF] 学習スタートに伴い、'{WEIGHT_FILE}' を初期値 (1.0) にリセットしました。")
 # ========================================================
+
+# ========================================================
+# 💡 評価用マップデータ保存処理（Python状態管理版）
+# ========================================================
+EVAL_DATA_DIR = "eval_data"
+os.makedirs(EVAL_DATA_DIR, exist_ok=True)
+
+# JAXのコンパイル空間の外側で累積ステップ数を管理する辞書
+GLOBAL_STEP_TRACKER = {"offset": 0}
+
+def save_eval_maps_callback(env_maps, current_step_val, instruct_csv_name):
+    """
+    JAXのpure_callbackから呼ばれ、評価時に生成されたマップ(N, H, W)を保存する
+    """
+    # Python側の最新オフセットを取得して加算
+    cumulative_offset = GLOBAL_STEP_TRACKER["offset"]
+    total_step = int(current_step_val) + int(cumulative_offset)
+    
+    csv_tag = str(instruct_csv_name).replace(".csv", "")
+    file_name = f"maps_step_{total_step:08d}_{csv_tag}.npy"
+    file_path = os.path.join(EVAL_DATA_DIR, file_name)
+    
+    np.save(file_path, np.array(env_maps))
+    print(f"\n💾 [EVAL DATA] {file_path} (通算: {total_step} steps) に保存しました。")
+# ========================================================
+
+
 
 # --- 既存の get_train_test と同等の処理を外出しにするヘルパー ---
 def load_new_instruction_from_csv(csv_name, config, max_instructs=128):
@@ -751,11 +780,6 @@ def make_train(config, restored_ckpt, checkpoint_manager, encoder_params):
 
 
             
-
-            # ========================================================
-            # ★ アイデア1対応: マスクを用いた固定サイズ動的サンプリング（アプローチA適用）
-            # ========================================================
-            # 初回のみプール変数を初期化
             if 'current_pool_reward_i' not in locals():
                 max_instructs = 128
                 actual_rows = train_inst.reward_i.shape[0]
@@ -781,10 +805,7 @@ def make_train(config, restored_ckpt, checkpoint_manager, encoder_params):
                 jax.ShapeDtypeStruct(current_pool_embedding.shape, current_pool_embedding.dtype),
                 jax.ShapeDtypeStruct(current_pool_mask.shape, current_pool_mask.dtype),
             )
-
-            # --------------------------------------------------------
-            # 💡 【アプローチA】指定したステップ頻度の時だけ CPU 問い合わせを実行
-            # --------------------------------------------------------
+            
             def _fetch_latest_pool(_):
                 return jax.pure_callback(
                     check_pause_callback,
@@ -845,7 +866,6 @@ def make_train(config, restored_ckpt, checkpoint_manager, encoder_params):
                     operand=None,
                 )
 
-            #==================================================================================
 
             def _evaluate_step():
 
@@ -964,6 +984,22 @@ def make_train(config, restored_ckpt, checkpoint_manager, encoder_params):
                 )
 
                 jax.debug.callback(_eval_callback, eval_metric, metric, states, frames)
+                
+                # ========================================================
+                # 💡 【修正】累積オフセットはPython側(GLOBAL_STEP_TRACKER)で直接参照する
+                # ========================================================
+                final_eval_maps = states.env_state.env_map[-1]
+                
+                # チャンク内の現在ステップ数 (0 ~ 30720)
+                current_step_val = update_steps * config.num_steps * config.n_envs
+                
+                jax.debug.callback(
+                    save_eval_maps_callback,
+                    final_eval_maps,
+                    current_step_val,
+                    config.instruct_csv
+                )
+                # ========================================================
 
                 if test_inst is not None:
                     loss = get_loss_batch(
@@ -1248,6 +1284,10 @@ def main_chunk(config, exp_dir, rng):
     
     for chunk_i in range(n_chunks):
         logger.info(f"=== チャンク {chunk_i + 1} / {n_chunks} を実行中 (累積開始ステップ: {cumulative_step}) ===")
+        
+        # 💡 追加: Pythonのグローバル変数へ現在の累積ステップ数を更新
+        GLOBAL_STEP_TRACKER["offset"] = cumulative_step
+       
         
         train_start_time = timer()
 

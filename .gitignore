@@ -25,3 +25,11 @@ notebook/.temp
 /LM_weights/
 
 ../multigame-pcgrl/pcgrl_buffer
+
+
+# 機械学習のチェックポイントやモデル出力を追跡対象外にする
+dpo/
+*.pt
+*.safetensors
+*.bin
+*.pth
